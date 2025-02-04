@@ -27,6 +27,90 @@ pub struct TestController {
     stream_results: HashMap<usize, StreamStats>,
 }
 
+#[cling::prelude::async_trait]
+trait TestServer {
+    async fn accept_stream(&mut self, stream: TcpStream) -> Result<()>;
+
+    async fn process_server_internal_message(
+        &mut self,
+        message: Option<ControllerMessage>,
+    ) -> Result<(), anyhow::Error>;
+}
+
+#[cling::prelude::async_trait]
+impl TestServer for TestController {
+    // Executed only on the server
+    async fn accept_stream(&mut self, stream: TcpStream) -> Result<()> {
+        assert_eq!(self.test.role, Role::Server);
+        let total_needed_streams: usize =
+            (self.test.num_send_streams + self.test.num_receive_streams) as usize;
+        self.create_and_register_stream_worker(stream);
+        if self.test.streams.len() == total_needed_streams {
+            // We have all streams ready, switch state and start load.
+            self.test.set_state(State::Running).await?;
+        }
+        Ok(())
+    }
+
+    async fn process_server_internal_message(
+        &mut self,
+        message: Option<ControllerMessage>,
+    ) -> Result<(), anyhow::Error> {
+        let message = message.unwrap();
+        match message {
+            ControllerMessage::CreateStream(stream) => self.accept_stream(stream).await?,
+            ControllerMessage::StreamTerminated(id) => {
+                let handle = self.test.streams.remove(&id);
+                if let Some(worker_ref) = handle {
+                    // join the task to retrieve the result.
+                    let result = worker_ref.join_handle.await.with_context(|| {
+                        format!("Couldn't join an internal task for stream: {}", id)
+                    })?;
+                    if let Ok(result) = result {
+                        self.stream_results.insert(id, result);
+                    } else {
+                        warn!(
+                            "Stream {} has terminated with an error, we cannot fetch its total \
+                             stream stats. This means that the results might be partial",
+                            id
+                        );
+                    }
+                }
+                if self.test.streams.is_empty() && self.test.role == Role::Server {
+                    // No more active streams, let's exchange results and finalise test.
+                    let _ = self.test.set_state(State::ExchangeResults).await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cling::prelude::async_trait]
+trait TestClient {
+    /// Executed only on the client. Establishes N connections to the server according to the
+    /// exchanged `TestParameters`
+    async fn create_streams(&mut self) -> Result<()>;
+}
+
+#[cling::prelude::async_trait]
+impl TestClient for TestController {
+    async fn create_streams(&mut self) -> Result<()> {
+        assert_eq!(self.test.role, Role::Client);
+        // Let's connect the send streams first. We will connect and authenticate streams
+        // sequentially for simplicity. The server expects all the (client-to-server) streams
+        // to be created first. That's an implicit assumption as part of the protocol.
+        let total_needed_streams: usize =
+            (self.test.num_send_streams + self.test.num_receive_streams) as usize;
+
+        while self.test.streams.len() < total_needed_streams {
+            let stream = self.connect_data_stream().await?;
+            self.create_and_register_stream_worker(stream);
+        }
+        Ok(())
+    }
+}
+
 impl TestController {
     pub fn new(test: PerfTest) -> Self {
         let (sender, receiver) = mpsc::channel(INTERNAL_PROT_BUFFER);
@@ -94,7 +178,8 @@ impl TestController {
             if self.test.role == Role::Server {
                 // We are a SERVER
                 let message = self.receiver.recv().await;
-                self.process_internal_message(message).await?;
+                TestServer::process_server_internal_message(&mut self, message).await?;
+                // self.process_internal_message(message).await?;
             } else {
                 // We are a CLIENT
                 let internal_message = self.receiver.recv();
@@ -242,19 +327,6 @@ impl TestController {
         Ok(())
     }
 
-    // Executed only on the server
-    async fn accept_stream(&mut self, stream: TcpStream) -> Result<()> {
-        assert_eq!(self.test.role, Role::Server);
-        let total_needed_streams: usize =
-            (self.test.num_send_streams + self.test.num_receive_streams) as usize;
-        self.create_and_register_stream_worker(stream);
-        if self.test.streams.len() == total_needed_streams {
-            // We have all streams ready, switch state and start load.
-            self.test.set_state(State::Running).await?;
-        }
-        Ok(())
-    }
-
     /// Creates a connection to the server that serves as a data stream to test the network.
     /// This method initialises the connection and performs the authentication as well.
     async fn connect_data_stream(&self) -> Result<TcpStream> {
@@ -311,22 +383,5 @@ impl TestController {
             join_handle: handle,
         };
         self.test.streams.insert(id, worker_ref);
-    }
-
-    /// Executed only on the client. Establishes N connections to the server according to the
-    /// exchanged `TestParameters`
-    async fn create_streams(&mut self) -> Result<()> {
-        assert_eq!(self.test.role, Role::Client);
-        // Let's connect the send streams first. We will connect and authenticate streams
-        // sequentially for simplicity. The server expects all the (client-to-server) streams
-        // to be created first. That's an implicit assumption as part of the protocol.
-        let total_needed_streams: usize =
-            (self.test.num_send_streams + self.test.num_receive_streams) as usize;
-
-        while self.test.streams.len() < total_needed_streams {
-            let stream = self.connect_data_stream().await?;
-            self.create_and_register_stream_worker(stream);
-        }
-        Ok(())
     }
 }
